@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Channel Analytics</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.0/Recharts.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState } = React;
+        const {
+            BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
+        } = window.Recharts;
+
+        function SimpleBarChart({ data }) {
+            return (
+                <ResponsiveContainer width="100%" height={400}>
+                    <BarChart data={data}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis
+                            dataKey="title"
+                            tick={{ fontSize: 12 }}
+                            angle={-45}
+                            textAnchor="end"
+                            height={100}
+                        />
+                        <YAxis tickFormatter={(value) => {
+                            if (value >= 1000000) return `${(value / 1000000).toFixed(1)}M`;
+                            if (value >= 1000) return `${(value / 1000).toFixed(1)}K`;
+                            return value;
+                        }} />
+                        <Tooltip />
+                        <Bar dataKey="views" fill="#3b82f6" />
+                    </BarChart>
+                </ResponsiveContainer>
+            );
+        }
+
+        function YouTubeAnalytics() {
+            const [channelInput, setChannelInput] = useState('');
+            const [timeRange, setTimeRange] = useState('last_day');
+            const [videos, setVideos] = useState([]);
+            const [isLoading, setIsLoading] = useState(false);
+            const [error, setError] = useState(null);
+            const [customRange, setCustomRange] = useState({
+                startDate: '',
+                endDate: ''
+            });
+            const [isCustomRange, setIsCustomRange] = useState(false);
+            const [apiKey, setApiKey] = useState('');
+
+            const timeRanges = {
+                last_day: { days: 1, label: 'Last 24 Hours' },
+                last_week: { days: 7, label: 'Last Week' },
+                last_month: { days: 30, label: 'Last Month' },
+                three_months: { days: 90, label: 'Last 3 Months' },
+                six_months: { days: 180, label: 'Last 6 Months' },
+                last_year: { days: 365, label: 'Last Year' },
+                last_five_years: { days: 1825, label: 'Last 5 Years' },
+                custom: { label: 'Custom Range' }
+            };
+
+            const formatViewCount = (views) => {
+                if (views >= 1000000) {
+                    return `${(views / 1000000).toFixed(1)}M`;
+                } else if (views >= 1000) {
+                    return `${(views / 1000).toFixed(1)}K`;
+                }
+                return views;
+            };
+
+            const extractChannelHandle = (input) => {
+                // Handle different YouTube URL formats
+                const handleMatch = input.match(/@([^/\s]+)/);
+                if (handleMatch) {
+                    return handleMatch[1];
+                }
+                // If it's already a handle without @
+                if (input.trim().match(/^[a-zA-Z0-9_-]+$/)) {
+                    return input.trim();
+                }
+                return null;
+            };
+
+            // Function to get channel ID from handle
+            async function getChannelId(handle) {
+                const response = await fetch(
+                    `https://youtube.googleapis.com/youtube/v3/search?part=snippet&q=${handle}&type=channel&key=${apiKey}`
+                );
+                const data = await response.json();
+
+                if (!data.items || data.items.length === 0) {
+                    throw new Error('Channel not found');
+                }
+
+                return data.items[0].snippet.channelId;
+            }
+
+            // Function to get channel's uploads playlist ID
+            async function getUploadsPlaylistId(channelId) {
+                const response = await fetch(
+                    `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id=${channelId}&key=${apiKey}`
+                );
+                const data = await response.json();
+
+                if (!data.items || data.items.length === 0) {
+                    throw new Error('Channel not found');
+                }
+
+                return data.items[0].contentDetails.relatedPlaylists.uploads;
+            }
+
+            // Function to get videos from playlist with date filtering
+            async function getVideosFromPlaylist(playlistId, startDate, endDate) {
+                let videos = [];
+                let nextPageToken = '';
+
+                do {
+                    const response = await fetch(
+                        `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId=${playlistId}&pageToken=${nextPageToken}&key=${apiKey}`
+                    );
+                    const data = await response.json();
+
+                    // Filter videos by date
+                    const filteredVideos = data.items.filter(item => {
+                        const publishedAt = new Date(item.snippet.publishedAt);
+                        return publishedAt >= startDate && publishedAt <= endDate;
+                    });
+
+                    videos = videos.concat(filteredVideos);
+                    nextPageToken = data.nextPageToken;
+
+                    // Limit to 500 videos to avoid excessive API usage
+                    if (videos.length >= 500) break;
+
+                } while (nextPageToken);
+
+                return videos;
+            }
+
+            // Function to get video statistics
+            async function getVideoStatistics(videoIds) {
+                const response = await fetch(
+                    `https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${videoIds.join(',')}&key=${apiKey}`
+                );
+                const data = await response.json();
+                return data.items;
+            }
+
+            // Main function to fetch all data
+            async function fetchYouTubeData(handle, timeRange, customRange) {
+                try {
+                    // Calculate date range
+                    let startDate, endDate = new Date();
+
+                    if (timeRange === 'custom') {
+                        startDate = new Date(customRange.startDate);
+                        endDate = new Date(customRange.endDate);
+                    } else {
+                        const days = timeRanges[timeRange].days;
+                        startDate = new Date();
+                        startDate.setDate(startDate.getDate() - days);
+                    }
+
+                    // Get channel ID from handle
+                    const channelId = await getChannelId(handle);
+
+                    // Get uploads playlist ID
+                    const uploadsPlaylistId = await getUploadsPlaylistId(channelId);
+
+                    // Get videos within date range
+                    const videos = await getVideosFromPlaylist(uploadsPlaylistId, startDate, endDate);
+
+                    // Get video statistics in batches of 50 (API limit)
+                    const videoIds = videos.map(video => video.snippet.resourceId.videoId);
+                    let allStats = [];
+
+                    for (let i = 0; i < videoIds.length; i += 50) {
+                        const batch = videoIds.slice(i, i + 50);
+                        const stats = await getVideoStatistics(batch);
+                        allStats = allStats.concat(stats);
+                    }
+
+                    // Combine video data with statistics
+                    const processedVideos = videos.map((video, index) => ({
+                        title: video.snippet.title,
+                        publishedAt: video.snippet.publishedAt,
+                        videoId: video.snippet.resourceId.videoId,
+                        views: parseInt(allStats[index].statistics.viewCount),
+                        likes: parseInt(allStats[index].statistics.likeCount),
+                        comments: parseInt(allStats[index].statistics.commentCount)
+                    }));
+
+                    // Sort by views
+                    return processedVideos.sort((a, b) => b.views - a.views);
+
+                } catch (error) {
+                    throw new Error(`Failed to fetch YouTube data: ${error.message}`);
+                }
+            }
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                setIsLoading(true);
+                setError(null);
+
+                try {
+                    const channelHandle = extractChannelHandle(channelInput);
+                    if (!channelHandle) {
+                        throw new Error('Invalid channel handle or URL format');
+                    }
+
+                    const data = await fetchYouTubeData(
+                        channelHandle,
+                        timeRange,
+                        isCustomRange ? customRange : null
+                    );
+                    setVideos(data);
+                } catch (err) {
+                    setError(err.message || 'Failed to fetch YouTube data');
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            return (
+                <div className="container mx-auto p-6 max-w-6xl">
+                    <div className="bg-white rounded-lg shadow-lg p-6">
+                        <h1 className="text-2xl font-bold mb-6">YouTube Channel Analytics</h1>
+
+                        <form onSubmit={handleSubmit} className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">
+                                    Channel Handle or URL
+                                </label>
+                                <input
+                                    type="text"
+                                    value={channelInput}
+                                    onChange={(e) => setChannelInput(e.target.value)}
+                                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                    placeholder="Enter @ChannelName or youtube.com/@ChannelName"
+                                    required
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">
+                                    Time Range
+                                </label>
+                                <select
+                                    value={timeRange}
+                                    onChange={(e) => {
+                                        setTimeRange(e.target.value);
+                                        setIsCustomRange(e.target.value === 'custom');
+                                    }}
+                                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                >
+                                    {Object.entries(timeRanges).map(([key, { label }]) => (
+                                        <option key={key} value={key}>
+                                            {label}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            {isCustomRange && (
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700">
+                                            Start Date
+                                        </label>
+                                        <input
+                                            type="date"
+                                            value={customRange.startDate}
+                                            onChange={(e) => setCustomRange(prev => ({
+                                                ...prev,
+                                                startDate: e.target.value
+                                            }))}
+                                            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                            required={isCustomRange}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700">
+                                            End Date
+                                        </label>
+                                        <input
+                                            type="date"
+                                            value={customRange.endDate}
+                                            onChange={(e) => setCustomRange(prev => ({
+                                                ...prev,
+                                                endDate: e.target.value
+                                            }))}
+                                            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                            required={isCustomRange}
+                                        />
+                                    </div>
+                                </div>
+                            )}
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">
+                                    API Key
+                                </label>
+                                <input
+                                    type="text"
+                                    value={apiKey}
+                                    onChange={(e) => setApiKey(e.target.value)}
+                                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                    placeholder="Enter your YouTube API Key"
+                                    required
+                                />
+                            </div>
+
+                            <button
+                                type="submit"
+                                className="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors"
+                                disabled={isLoading}
+                            >
+                                {isLoading ? 'Loading...' : 'Analyze'}
+                            </button>
+                        </form>
+
+                        {error && (
+                            <div className="mt-4 p-4 bg-red-100 text-red-700 rounded-md">
+                                {error}
+                            </div>
+                        )}
+
+                        {videos.length > 0 && (
+                            <div className="mt-8">
+                                <h2 className="text-xl font-semibold mb-4">Most Popular Videos</h2>
+                                <SimpleBarChart data={videos} />
+
+                                <div className="mt-6 overflow-x-auto">
+                                    <table className="min-w-full divide-y divide-gray-200">
+                                        <thead className="bg-gray-50">
+                                            <tr>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Video Title
+                                                </th>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Views
+                                                </th>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Published Date
+                                                </th>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Link
+                                                </th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="bg-white divide-y divide-gray-200">
+                                            {videos.map((video) => (
+                                                <tr key={video.videoId}>
+                                                    <td className="px-6 py-4 whitespace-nowrap">
+                                                        {video.title}
+                                                    </td>
+                                                    <td className="px-6 py-4 whitespace-nowrap">
+                                                        {formatViewCount(video.views)}
+                                                    </td>
+                                                    <td className="px-6 py-4 whitespace-nowrap">
+                                                        {new Date(video.publishedAt).toLocaleDateString()}
+                                                    </td>
+                                                    <td className="px-6 py-4 whitespace-nowrap">
+                                                        <a
+                                                            href={`https://www.youtube.com/watch?v=${video.videoId}`}
+                                                            target="_blank"
+                                                            rel="noopener noreferrer"
+                                                            className="text-blue-600 hover:text-blue-800 cursor-pointer"
+                                                        >
+                                                            Watch
+                                                        </a>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<YouTubeAnalytics />, document.getElementById('root'));
+    </script>
+</body>
+
+</html>
