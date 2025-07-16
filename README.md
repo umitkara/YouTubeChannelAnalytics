@@ -4,6 +4,8 @@ A small simple web app that provides analytics for YouTube channels. For an end-
 
 Provide a channel URL like https://www.youtube.com/@Youtube and an API key.
 
+![YouTube Channel Analytics Screenshot](screenshot.png)
+
 ## Technologies Used
 
 - **React**: For building the user interface.
