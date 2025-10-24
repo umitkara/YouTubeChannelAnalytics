@@ -14,10 +14,10 @@ A simple web app that provides analytics for YouTube channels. YouTube doesn't p
 ## Screenshots
 
 ### All Videos Tab
-![All Videos Tab](screenshot-all-videos.png)
+![All Videos Tab](ss1.jpeg)
 
 ### Collection View
-![Collection with Videos](screenshot-collection.png)
+![Collection with Videos](ss2.jpeg)
 
 ## Technologies Used
 
