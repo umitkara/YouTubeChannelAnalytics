@@ -31,7 +31,7 @@ A simple web app that provides analytics for YouTube channels. YouTube doesn't p
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/your-repo-name.git
+   git clone https://github.com/umitkara/YouTubeChannelAnalytics.git
    ```
 
 2. Open the `index.html` file in your browser to run the application.
