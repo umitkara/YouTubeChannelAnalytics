@@ -1,0 +1,1723 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Channel Analytics</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.0/Recharts.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+        const {
+            BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
+        } = window.Recharts;
+
+        // ============================================
+        // IndexedDB Manager for Collections
+        // ============================================
+        const DB_NAME = 'YouTubeCollectionsDB';
+        const DB_VERSION = 1;
+        const COLLECTIONS_STORE = 'collections';
+        const COLLECTION_VIDEOS_STORE = 'collectionVideos';
+
+        const dbManager = {
+            db: null,
+
+            async initDB() {
+                return new Promise((resolve, reject) => {
+                    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+                    request.onerror = () => reject(request.error);
+                    request.onsuccess = () => {
+                        this.db = request.result;
+                        resolve(this.db);
+                    };
+
+                    request.onupgradeneeded = (event) => {
+                        const db = event.target.result;
+
+                        // Create collections store
+                        if (!db.objectStoreNames.contains(COLLECTIONS_STORE)) {
+                            const collectionsStore = db.createObjectStore(COLLECTIONS_STORE, { keyPath: 'id' });
+                            collectionsStore.createIndex('name', 'name', { unique: true });
+                            collectionsStore.createIndex('createdDate', 'createdDate', { unique: false });
+                        }
+
+                        // Create collection videos store
+                        if (!db.objectStoreNames.contains(COLLECTION_VIDEOS_STORE)) {
+                            const collectionVideosStore = db.createObjectStore(COLLECTION_VIDEOS_STORE, { keyPath: 'id', autoIncrement: true });
+                            collectionVideosStore.createIndex('collectionId', 'collectionId', { unique: false });
+                            collectionVideosStore.createIndex('videoId', 'videoId', { unique: false });
+                            collectionVideosStore.createIndex('addedDate', 'addedDate', { unique: false });
+                        }
+                    };
+                });
+            },
+
+            async getAllCollections() {
+                if (!this.db) await this.initDB();
+                return new Promise((resolve, reject) => {
+                    const transaction = this.db.transaction([COLLECTIONS_STORE], 'readonly');
+                    const store = transaction.objectStore(COLLECTIONS_STORE);
+                    const request = store.getAll();
+
+                    request.onsuccess = () => resolve(request.result);
+                    request.onerror = () => reject(request.error);
+                });
+            },
+
+            async createCollection(name, description = '') {
+                if (!this.db) await this.initDB();
+                const collection = {
+                    id: 'collection_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9),
+                    name,
+                    description,
+                    createdDate: new Date().toISOString(),
+                    videoCount: 0
+                };
+
+                return new Promise((resolve, reject) => {
+                    const transaction = this.db.transaction([COLLECTIONS_STORE], 'readwrite');
+                    const store = transaction.objectStore(COLLECTIONS_STORE);
+                    const request = store.add(collection);
+
+                    request.onsuccess = () => resolve(collection);
+                    request.onerror = () => reject(request.error);
+                });
+            },
+
+            async updateCollection(id, updates) {
+                if (!this.db) await this.initDB();
+                return new Promise(async (resolve, reject) => {
+                    const transaction = this.db.transaction([COLLECTIONS_STORE], 'readwrite');
+                    const store = transaction.objectStore(COLLECTIONS_STORE);
+                    const getRequest = store.get(id);
+
+                    getRequest.onsuccess = () => {
+                        const collection = getRequest.result;
+                        if (!collection) {
+                            reject(new Error('Collection not found'));
+                            return;
+                        }
+
+                        const updated = { ...collection, ...updates };
+                        const putRequest = store.put(updated);
+
+                        putRequest.onsuccess = () => resolve(updated);
+                        putRequest.onerror = () => reject(putRequest.error);
+                    };
+
+                    getRequest.onerror = () => reject(getRequest.error);
+                });
+            },
+
+            async deleteCollection(id) {
+                if (!this.db) await this.initDB();
+                return new Promise(async (resolve, reject) => {
+                    const transaction = this.db.transaction([COLLECTIONS_STORE, COLLECTION_VIDEOS_STORE], 'readwrite');
+
+                    // Delete collection
+                    const collectionsStore = transaction.objectStore(COLLECTIONS_STORE);
+                    collectionsStore.delete(id);
+
+                    // Delete all videos in this collection
+                    const videosStore = transaction.objectStore(COLLECTION_VIDEOS_STORE);
+                    const index = videosStore.index('collectionId');
+                    const range = IDBKeyRange.only(id);
+                    const request = index.openCursor(range);
+
+                    request.onsuccess = (event) => {
+                        const cursor = event.target.result;
+                        if (cursor) {
+                            cursor.delete();
+                            cursor.continue();
+                        }
+                    };
+
+                    transaction.oncomplete = () => resolve();
+                    transaction.onerror = () => reject(transaction.error);
+                });
+            },
+
+            async addVideosToCollection(collectionId, videos) {
+                if (!this.db) await this.initDB();
+                return new Promise(async (resolve, reject) => {
+                    const transaction = this.db.transaction([COLLECTION_VIDEOS_STORE, COLLECTIONS_STORE], 'readwrite');
+                    const videosStore = transaction.objectStore(COLLECTION_VIDEOS_STORE);
+                    const collectionsStore = transaction.objectStore(COLLECTIONS_STORE);
+
+                    let addedCount = 0;
+
+                    // Check for existing videos and add new ones
+                    const addVideo = async (video) => {
+                        return new Promise((res, rej) => {
+                            // Check if video already exists in collection
+                            const index = videosStore.index('collectionId');
+                            const range = IDBKeyRange.only(collectionId);
+                            const request = index.openCursor(range);
+                            let exists = false;
+
+                            request.onsuccess = (event) => {
+                                const cursor = event.target.result;
+                                if (cursor) {
+                                    if (cursor.value.videoId === video.videoId) {
+                                        exists = true;
+                                    }
+                                    cursor.continue();
+                                } else {
+                                    // Done checking, add if doesn't exist
+                                    if (!exists) {
+                                        const collectionVideo = {
+                                            collectionId,
+                                            videoId: video.videoId,
+                                            addedDate: new Date().toISOString(),
+                                            videoData: { ...video }
+                                        };
+                                        videosStore.add(collectionVideo);
+                                        addedCount++;
+                                    }
+                                    res();
+                                }
+                            };
+                            request.onerror = () => rej(request.error);
+                        });
+                    };
+
+                    // Add all videos
+                    for (const video of videos) {
+                        await addVideo(video);
+                    }
+
+                    // Update collection video count
+                    const getCollectionRequest = collectionsStore.get(collectionId);
+                    getCollectionRequest.onsuccess = () => {
+                        const collection = getCollectionRequest.result;
+                        if (collection) {
+                            collection.videoCount = (collection.videoCount || 0) + addedCount;
+                            collectionsStore.put(collection);
+                        }
+                    };
+
+                    transaction.oncomplete = () => resolve(addedCount);
+                    transaction.onerror = () => reject(transaction.error);
+                });
+            },
+
+            async removeVideosFromCollection(collectionId, videoIds) {
+                if (!this.db) await this.initDB();
+                return new Promise((resolve, reject) => {
+                    const transaction = this.db.transaction([COLLECTION_VIDEOS_STORE, COLLECTIONS_STORE], 'readwrite');
+                    const videosStore = transaction.objectStore(COLLECTION_VIDEOS_STORE);
+                    const collectionsStore = transaction.objectStore(COLLECTIONS_STORE);
+
+                    const index = videosStore.index('collectionId');
+                    const range = IDBKeyRange.only(collectionId);
+                    const request = index.openCursor(range);
+
+                    let removedCount = 0;
+
+                    request.onsuccess = (event) => {
+                        const cursor = event.target.result;
+                        if (cursor) {
+                            if (videoIds.includes(cursor.value.videoId)) {
+                                cursor.delete();
+                                removedCount++;
+                            }
+                            cursor.continue();
+                        } else {
+                            // Update collection video count
+                            const getCollectionRequest = collectionsStore.get(collectionId);
+                            getCollectionRequest.onsuccess = () => {
+                                const collection = getCollectionRequest.result;
+                                if (collection) {
+                                    collection.videoCount = Math.max(0, (collection.videoCount || 0) - removedCount);
+                                    collectionsStore.put(collection);
+                                }
+                            };
+                        }
+                    };
+
+                    transaction.oncomplete = () => resolve(removedCount);
+                    transaction.onerror = () => reject(transaction.error);
+                });
+            },
+
+            async getCollectionVideos(collectionId) {
+                if (!this.db) await this.initDB();
+                return new Promise((resolve, reject) => {
+                    const transaction = this.db.transaction([COLLECTION_VIDEOS_STORE], 'readonly');
+                    const store = transaction.objectStore(COLLECTION_VIDEOS_STORE);
+                    const index = store.index('collectionId');
+                    const range = IDBKeyRange.only(collectionId);
+                    const request = index.getAll(range);
+
+                    request.onsuccess = () => {
+                        const results = request.result.map(item => item.videoData);
+                        resolve(results);
+                    };
+                    request.onerror = () => reject(request.error);
+                });
+            },
+
+            async checkVideoInCollection(collectionId, videoId) {
+                if (!this.db) await this.initDB();
+                return new Promise((resolve, reject) => {
+                    const transaction = this.db.transaction([COLLECTION_VIDEOS_STORE], 'readonly');
+                    const store = transaction.objectStore(COLLECTION_VIDEOS_STORE);
+                    const index = store.index('collectionId');
+                    const range = IDBKeyRange.only(collectionId);
+                    const request = index.openCursor(range);
+
+                    let found = false;
+
+                    request.onsuccess = (event) => {
+                        const cursor = event.target.result;
+                        if (cursor) {
+                            if (cursor.value.videoId === videoId) {
+                                found = true;
+                                resolve(true);
+                                return;
+                            }
+                            cursor.continue();
+                        } else {
+                            resolve(false);
+                        }
+                    };
+
+                    request.onerror = () => reject(request.error);
+                });
+            }
+        };
+
+        function SimpleBarChart({ data }) {
+            return (
+                <ResponsiveContainer width="100%" height={400}>
+                    <BarChart data={data}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis
+                            dataKey="title"
+                            tick={{ fontSize: 12 }}
+                            angle={-45}
+                            textAnchor="end"
+                            height={100}
+                        />
+                        <YAxis tickFormatter={(value) => {
+                            if (value >= 1000000) return `${(value / 1000000).toFixed(1)}M`;
+                            if (value >= 1000) return `${(value / 1000).toFixed(1)}K`;
+                            return value;
+                        }} />
+                        <Tooltip />
+                        <Bar dataKey="views" fill="#3b82f6" />
+                    </BarChart>
+                </ResponsiveContainer>
+            );
+        }
+
+        function YouTubeAnalytics() {
+            const [channelInput, setChannelInput] = useState('');
+            const [timeRange, setTimeRange] = useState('last_day');
+            const [apiKey, setApiKey] = useState('');
+            const [videos, setVideos] = useState([]);
+            const [isLoading, setIsLoading] = useState(false);
+            const [error, setError] = useState(null);
+            const [customRange, setCustomRange] = useState({
+                startDate: '',
+                endDate: ''
+            });
+            const [isCustomRange, setIsCustomRange] = useState(false);
+            const [filters, setFilters] = useState({
+                durationRange: 'all',
+                videoType: 'all',
+                minViews: '',
+                searchTerm: ''
+            });
+            const [lastFetchTime, setLastFetchTime] = useState(null);
+            const [lastFetchParams, setLastFetchParams] = useState(null);
+
+            // Collections state
+            const [collections, setCollections] = useState([]);
+            const [currentTab, setCurrentTab] = useState('all-videos');
+            const [currentCollectionVideos, setCurrentCollectionVideos] = useState([]);
+            const [selectedVideoIds, setSelectedVideoIds] = useState([]);
+            const [showCollectionModal, setShowCollectionModal] = useState(false);
+            const [collectionModalMode, setCollectionModalMode] = useState('create'); // 'create' or 'rename'
+            const [editingCollection, setEditingCollection] = useState(null);
+            const [showConfirmDialog, setShowConfirmDialog] = useState(false);
+            const [confirmDialogData, setConfirmDialogData] = useState(null);
+            const [toast, setToast] = useState(null);
+
+            const timeRanges = {
+                last_day: { days: 1, label: 'Last 24 Hours' },
+                last_week: { days: 7, label: 'Last Week' },
+                last_month: { days: 30, label: 'Last Month' },
+                three_months: { days: 90, label: 'Last 3 Months' },
+                six_months: { days: 180, label: 'Last 6 Months' },
+                last_year: { days: 365, label: 'Last Year' },
+                last_five_years: { days: 1825, label: 'Last 5 Years' },
+                custom: { label: 'Custom Range' }
+            };
+
+            const formatViewCount = (views) => {
+                if (views >= 1000000) {
+                    return `${(views / 1000000).toFixed(1)}M`;
+                } else if (views >= 1000) {
+                    return `${(views / 1000).toFixed(1)}K`;
+                }
+                return views;
+            };
+
+            // Toast notification helper
+            const showToast = (message, type = 'success') => {
+                setToast({ message, type });
+                setTimeout(() => setToast(null), 3000);
+            };
+
+            // Load collections on component mount
+            useEffect(() => {
+                const loadCollections = async () => {
+                    try {
+                        await dbManager.initDB();
+                        const loadedCollections = await dbManager.getAllCollections();
+                        setCollections(loadedCollections);
+                    } catch (error) {
+                        console.error('Failed to load collections:', error);
+                        showToast('Failed to load collections', 'error');
+                    }
+                };
+                loadCollections();
+            }, []);
+
+            // Load collection videos when tab changes
+            useEffect(() => {
+                const loadCollectionVideos = async () => {
+                    if (currentTab !== 'all-videos') {
+                        try {
+                            const videos = await dbManager.getCollectionVideos(currentTab);
+                            setCurrentCollectionVideos(videos);
+                        } catch (error) {
+                            console.error('Failed to load collection videos:', error);
+                            showToast('Failed to load collection videos', 'error');
+                        }
+                    }
+                };
+                loadCollectionVideos();
+            }, [currentTab]);
+
+            // Collection management functions
+            const handleCreateCollection = async (name, description) => {
+                try {
+                    // Check for duplicate names
+                    const existingCollection = collections.find(c => c.name.toLowerCase() === name.toLowerCase());
+                    if (existingCollection) {
+                        showToast('A collection with this name already exists', 'error');
+                        return false;
+                    }
+
+                    const newCollection = await dbManager.createCollection(name, description);
+                    setCollections([...collections, newCollection]);
+                    showToast(`Collection "${name}" created successfully`);
+                    setShowCollectionModal(false);
+                    setCurrentTab(newCollection.id);
+                    return true;
+                } catch (error) {
+                    console.error('Failed to create collection:', error);
+                    showToast('Failed to create collection', 'error');
+                    return false;
+                }
+            };
+
+            const handleRenameCollection = async (name, description) => {
+                try {
+                    // Check for duplicate names (excluding current collection)
+                    const existingCollection = collections.find(c =>
+                        c.id !== editingCollection.id && c.name.toLowerCase() === name.toLowerCase()
+                    );
+                    if (existingCollection) {
+                        showToast('A collection with this name already exists', 'error');
+                        return false;
+                    }
+
+                    const updated = await dbManager.updateCollection(editingCollection.id, { name, description });
+                    setCollections(collections.map(c => c.id === updated.id ? updated : c));
+                    showToast(`Collection renamed to "${name}"`);
+                    setShowCollectionModal(false);
+                    setEditingCollection(null);
+                    return true;
+                } catch (error) {
+                    console.error('Failed to rename collection:', error);
+                    showToast('Failed to rename collection', 'error');
+                    return false;
+                }
+            };
+
+            const handleDeleteCollection = async (collectionId) => {
+                const collection = collections.find(c => c.id === collectionId);
+                if (!collection) return;
+
+                setConfirmDialogData({
+                    title: `Delete "${collection.name}"?`,
+                    message: `This will permanently delete this collection and remove all ${collection.videoCount} videos from it. This action cannot be undone.`,
+                    confirmText: 'Delete Collection',
+                    confirmStyle: 'danger',
+                    onConfirm: async () => {
+                        try {
+                            await dbManager.deleteCollection(collectionId);
+                            setCollections(collections.filter(c => c.id !== collectionId));
+                            if (currentTab === collectionId) {
+                                setCurrentTab('all-videos');
+                            }
+                            showToast(`Collection "${collection.name}" deleted`);
+                            setShowConfirmDialog(false);
+                        } catch (error) {
+                            console.error('Failed to delete collection:', error);
+                            showToast('Failed to delete collection', 'error');
+                        }
+                    }
+                });
+                setShowConfirmDialog(true);
+            };
+
+            const handleAddToCollection = async (videoIds, collectionId) => {
+                try {
+                    const videosToAdd = videos.filter(v => videoIds.includes(v.videoId));
+                    const addedCount = await dbManager.addVideosToCollection(collectionId, videosToAdd);
+
+                    // Update collection video count
+                    const updatedCollections = await dbManager.getAllCollections();
+                    setCollections(updatedCollections);
+
+                    if (addedCount === 0) {
+                        showToast('Videos already in collection', 'info');
+                    } else if (addedCount === 1) {
+                        showToast('1 video added to collection');
+                    } else {
+                        showToast(`${addedCount} videos added to collection`);
+                    }
+
+                    setSelectedVideoIds([]);
+                } catch (error) {
+                    console.error('Failed to add videos to collection:', error);
+                    showToast('Failed to add videos to collection', 'error');
+                }
+            };
+
+            const handleRemoveFromCollection = async (videoIds) => {
+                try {
+                    await dbManager.removeVideosFromCollection(currentTab, videoIds);
+
+                    // Reload collection videos
+                    const videos = await dbManager.getCollectionVideos(currentTab);
+                    setCurrentCollectionVideos(videos);
+
+                    // Update collection video count
+                    const updatedCollections = await dbManager.getAllCollections();
+                    setCollections(updatedCollections);
+
+                    if (videoIds.length === 1) {
+                        showToast('Video removed from collection');
+                    } else {
+                        showToast(`${videoIds.length} videos removed from collection`);
+                    }
+                } catch (error) {
+                    console.error('Failed to remove videos from collection:', error);
+                    showToast('Failed to remove videos from collection', 'error');
+                }
+            };
+
+            const handleTabChange = (tabId) => {
+                setCurrentTab(tabId);
+                setSelectedVideoIds([]);
+            };
+
+            const toggleVideoSelection = (videoId) => {
+                if (selectedVideoIds.includes(videoId)) {
+                    setSelectedVideoIds(selectedVideoIds.filter(id => id !== videoId));
+                } else {
+                    setSelectedVideoIds([...selectedVideoIds, videoId]);
+                }
+            };
+
+            const toggleSelectAll = () => {
+                const videosToSelect = currentTab === 'all-videos' ? filteredVideos : currentCollectionVideos;
+                if (selectedVideoIds.length === videosToSelect.length) {
+                    setSelectedVideoIds([]);
+                } else {
+                    setSelectedVideoIds(videosToSelect.map(v => v.videoId));
+                }
+            };
+
+            // Filter videos based on current filters
+            const getFilteredVideos = () => {
+                const sourceVideos = currentTab === 'all-videos' ? videos : currentCollectionVideos;
+                return sourceVideos.filter(video => {
+                    // Video type filter
+                    if (filters.videoType !== 'all' && video.videoType !== filters.videoType) {
+                        return false;
+                    }
+
+                    // Duration filter
+                    if (filters.durationRange !== 'all') {
+                        const duration = video.duration;
+                        switch (filters.durationRange) {
+                            case 'shorts': // < 1 minute
+                                if (duration >= 60) return false;
+                                break;
+                            case 'short': // 1-5 minutes
+                                if (duration < 60 || duration > 300) return false;
+                                break;
+                            case 'medium': // 5-20 minutes
+                                if (duration < 300 || duration > 1200) return false;
+                                break;
+                            case 'long': // 20-60 minutes
+                                if (duration < 1200 || duration > 3600) return false;
+                                break;
+                            case 'very_long': // > 60 minutes
+                                if (duration <= 3600) return false;
+                                break;
+                        }
+                    }
+
+                    // Views filter
+                    if (filters.minViews && video.views < parseInt(filters.minViews)) {
+                        return false;
+                    }
+
+                    // Search term filter
+                    if (filters.searchTerm && !video.title.toLowerCase().includes(filters.searchTerm.toLowerCase())) {
+                        return false;
+                    }
+
+                    return true;
+                });
+            };
+
+            const filteredVideos = getFilteredVideos();
+
+            const extractChannelHandle = (input) => {
+                // Handle different YouTube URL formats
+                const handleMatch = input.match(/@([^/\s]+)/);
+                if (handleMatch) {
+                    return handleMatch[1];
+                }
+                // If it's already a handle without @
+                if (input.trim().match(/^[a-zA-Z0-9_-]+$/)) {
+                    return input.trim();
+                }
+                return null;
+            };
+
+            // Function to get channel ID from handle
+            async function getChannelId(handle, apiKey) {
+                const response = await fetch(
+                    `https://youtube.googleapis.com/youtube/v3/search?part=snippet&q=${handle}&type=channel&key=${apiKey}`
+                );
+                const data = await response.json();
+
+                if (!data.items || data.items.length === 0) {
+                    throw new Error('Channel not found');
+                }
+
+                return data.items[0].snippet.channelId;
+            }
+
+            // Function to get channel's uploads playlist ID
+            async function getUploadsPlaylistId(channelId, apiKey) {
+                const response = await fetch(
+                    `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id=${channelId}&key=${apiKey}`
+                );
+                const data = await response.json();
+
+                if (!data.items || data.items.length === 0) {
+                    throw new Error('Channel not found');
+                }
+
+                return data.items[0].contentDetails.relatedPlaylists.uploads;
+            }
+
+            // Function to get videos from playlist with date filtering
+            async function getVideosFromPlaylist(playlistId, startDate, endDate, apiKey) {
+                let videos = [];
+                let nextPageToken = '';
+
+                do {
+                    const response = await fetch(
+                        `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId=${playlistId}&pageToken=${nextPageToken}&key=${apiKey}`
+                    );
+                    const data = await response.json();
+
+                    // Filter videos by date
+                    const filteredVideos = data.items.filter(item => {
+                        const publishedAt = new Date(item.snippet.publishedAt);
+                        return publishedAt >= startDate && publishedAt <= endDate;
+                    });
+
+                    videos = videos.concat(filteredVideos);
+                    nextPageToken = data.nextPageToken;
+
+                    // Limit to 500 videos to avoid excessive API usage
+                    if (videos.length >= 500) break;
+
+                } while (nextPageToken);
+
+                return videos;
+            }
+
+            // Function to parse ISO 8601 duration to seconds
+            function parseDuration(duration) {
+                const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+                const hours = parseInt(match[1] || 0);
+                const minutes = parseInt(match[2] || 0);
+                const seconds = parseInt(match[3] || 0);
+                return hours * 3600 + minutes * 60 + seconds;
+            }
+
+            // Function to format seconds to readable duration
+            function formatDuration(seconds) {
+                const hours = Math.floor(seconds / 3600);
+                const minutes = Math.floor((seconds % 3600) / 60);
+                const secs = seconds % 60;
+
+                if (hours > 0) {
+                    return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+                }
+                return `${minutes}:${secs.toString().padStart(2, '0')}`;
+            }
+
+            // Function to determine video type based on duration
+            function getVideoType(seconds) {
+                if (seconds < 60) return 'Short';
+                if (seconds <= 600) return 'Regular'; // Up to 10 minutes
+                if (seconds <= 1200) return 'Medium'; // 10-20 minutes
+                return 'Long-form';
+            }
+
+            // Function to get video statistics and content details
+            async function getVideoStatistics(videoIds, apiKey) {
+                const response = await fetch(
+                    `https://www.googleapis.com/youtube/v3/videos?part=statistics,contentDetails&id=${videoIds.join(',')}&key=${apiKey}`
+                );
+                const data = await response.json();
+                return data.items;
+            }
+
+            // Main function to fetch all data
+            async function fetchYouTubeData(handle, timeRange, customRange, apiKey) {
+                try {
+                    // Calculate date range
+                    let startDate, endDate = new Date();
+
+                    if (timeRange === 'custom') {
+                        startDate = new Date(customRange.startDate);
+                        endDate = new Date(customRange.endDate);
+                    } else {
+                        const days = timeRanges[timeRange].days;
+                        startDate = new Date();
+                        startDate.setDate(startDate.getDate() - days);
+                    }
+
+                    // Get channel ID from handle
+                    const channelId = await getChannelId(handle, apiKey);
+
+                    // Get uploads playlist ID
+                    const uploadsPlaylistId = await getUploadsPlaylistId(channelId, apiKey);
+
+                    // Get videos within date range
+                    const videos = await getVideosFromPlaylist(uploadsPlaylistId, startDate, endDate, apiKey);
+
+                    // Get video statistics in batches of 50 (API limit)
+                    const videoIds = videos.map(video => video.snippet.resourceId.videoId);
+                    let allStats = [];
+
+                    for (let i = 0; i < videoIds.length; i += 50) {
+                        const batch = videoIds.slice(i, i + 50);
+                        const stats = await getVideoStatistics(batch, apiKey);
+                        allStats = allStats.concat(stats);
+                    }
+
+                    // Combine video data with statistics
+                    const processedVideos = videos.map((video, index) => {
+                        const durationInSeconds = parseDuration(allStats[index].contentDetails.duration);
+                        return {
+                            title: video.snippet.title,
+                            publishedAt: video.snippet.publishedAt,
+                            videoId: video.snippet.resourceId.videoId,
+                            thumbnail: video.snippet.thumbnails.medium?.url || video.snippet.thumbnails.default?.url,
+                            views: parseInt(allStats[index].statistics.viewCount),
+                            likes: parseInt(allStats[index].statistics.likeCount || 0),
+                            comments: parseInt(allStats[index].statistics.commentCount || 0),
+                            duration: durationInSeconds,
+                            durationFormatted: formatDuration(durationInSeconds),
+                            videoType: getVideoType(durationInSeconds)
+                        };
+                    });
+
+                    // Sort by views
+                    return processedVideos.sort((a, b) => b.views - a.views);
+
+                } catch (error) {
+                    throw new Error(`Failed to fetch YouTube data: ${error.message}`);
+                }
+            }
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                setIsLoading(true);
+                setError(null);
+
+                try {
+                    if (!apiKey.trim()) {
+                        throw new Error('Please enter a YouTube API key');
+                    }
+
+                    const channelHandle = extractChannelHandle(channelInput);
+                    if (!channelHandle) {
+                        throw new Error('Invalid channel handle or URL format');
+                    }
+
+                    const data = await fetchYouTubeData(
+                        channelHandle,
+                        timeRange,
+                        isCustomRange ? customRange : null,
+                        apiKey.trim()
+                    );
+                    setVideos(data);
+                    setLastFetchTime(new Date());
+                    setLastFetchParams({
+                        handle: channelHandle,
+                        timeRange: timeRanges[timeRange].label,
+                        videoCount: data.length
+                    });
+                } catch (err) {
+                    setError(err.message || 'Failed to fetch YouTube data');
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            // ============================================
+            // UI Components
+            // ============================================
+
+            // Toast Notification Component
+            const Toast = () => {
+                if (!toast) return null;
+
+                const bgColor = toast.type === 'error' ? 'bg-red-500' : toast.type === 'info' ? 'bg-blue-500' : 'bg-green-500';
+
+                return (
+                    <div className="fixed top-4 right-4 z-50 animate-slide-in">
+                        <div className={`${bgColor} text-white px-6 py-3 rounded-lg shadow-lg flex items-center space-x-2`}>
+                            <span>{toast.message}</span>
+                        </div>
+                    </div>
+                );
+            };
+
+            // Tab Navigation Component
+            const TabNavigation = () => {
+                return (
+                    <div className="border-b border-gray-200 mb-6">
+                        <div className="flex items-center space-x-1 overflow-x-auto">
+                            <button
+                                onClick={() => handleTabChange('all-videos')}
+                                className={`px-4 py-2 text-sm font-medium whitespace-nowrap transition-colors ${
+                                    currentTab === 'all-videos'
+                                        ? 'border-b-2 border-blue-600 text-blue-600'
+                                        : 'text-gray-600 hover:text-gray-800 hover:bg-gray-50'
+                                }`}
+                            >
+                                All Videos
+                            </button>
+
+                            {collections.map(collection => (
+                                <div key={collection.id} className="relative group">
+                                    <button
+                                        onClick={() => handleTabChange(collection.id)}
+                                        className={`px-4 py-2 text-sm font-medium whitespace-nowrap transition-colors flex items-center space-x-2 ${
+                                            currentTab === collection.id
+                                                ? 'border-b-2 border-blue-600 text-blue-600'
+                                                : 'text-gray-600 hover:text-gray-800 hover:bg-gray-50'
+                                        }`}
+                                    >
+                                        <span>{collection.name}</span>
+                                        <span className={`px-2 py-0.5 text-xs rounded-full ${
+                                            collection.videoCount > 0 ? 'bg-blue-100 text-blue-800' : 'bg-gray-100 text-gray-600'
+                                        }`}>
+                                            {collection.videoCount}
+                                        </span>
+                                    </button>
+
+                                    {/* Collection actions menu */}
+                                    <div className="absolute right-0 top-full mt-1 hidden group-hover:block z-10">
+                                        <div className="bg-white border border-gray-200 rounded-lg shadow-lg py-1 min-w-[120px]">
+                                            <button
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    setEditingCollection(collection);
+                                                    setCollectionModalMode('rename');
+                                                    setShowCollectionModal(true);
+                                                }}
+                                                className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100"
+                                            >
+                                                Rename
+                                            </button>
+                                            <button
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    handleDeleteCollection(collection.id);
+                                                }}
+                                                className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50"
+                                            >
+                                                Delete
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+
+                            <button
+                                onClick={() => {
+                                    setCollectionModalMode('create');
+                                    setEditingCollection(null);
+                                    setShowCollectionModal(true);
+                                }}
+                                className="px-4 py-2 text-sm font-medium text-gray-600 hover:text-blue-600 hover:bg-blue-50 transition-colors whitespace-nowrap"
+                                title="Create new collection"
+                            >
+                                + New Collection
+                            </button>
+                        </div>
+                    </div>
+                );
+            };
+
+            // Collection Modal Component
+            const CollectionModal = () => {
+                const [name, setName] = useState(editingCollection?.name || '');
+                const [description, setDescription] = useState(editingCollection?.description || '');
+                const [nameError, setNameError] = useState('');
+
+                useEffect(() => {
+                    if (showCollectionModal) {
+                        setName(editingCollection?.name || '');
+                        setDescription(editingCollection?.description || '');
+                        setNameError('');
+                    }
+                }, [showCollectionModal, editingCollection]);
+
+                const validateName = (value) => {
+                    if (!value.trim()) {
+                        return 'Collection name is required';
+                    }
+                    if (value.length < 3 || value.length > 50) {
+                        return 'Name must be between 3 and 50 characters';
+                    }
+                    if (!/^[a-zA-Z0-9\s\-]+$/.test(value)) {
+                        return 'Name can only contain letters, numbers, spaces, and hyphens';
+                    }
+                    return '';
+                };
+
+                const handleSubmit = async (e) => {
+                    e.preventDefault();
+                    const error = validateName(name);
+                    if (error) {
+                        setNameError(error);
+                        return;
+                    }
+
+                    const success = collectionModalMode === 'create'
+                        ? await handleCreateCollection(name.trim(), description.trim())
+                        : await handleRenameCollection(name.trim(), description.trim());
+
+                    if (success) {
+                        setName('');
+                        setDescription('');
+                    }
+                };
+
+                if (!showCollectionModal) return null;
+
+                return (
+                    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                        <div className="bg-white rounded-lg shadow-xl p-6 w-full max-w-md">
+                            <h2 className="text-xl font-bold mb-4">
+                                {collectionModalMode === 'create' ? 'Create New Collection' : 'Rename Collection'}
+                            </h2>
+
+                            <form onSubmit={handleSubmit}>
+                                <div className="mb-4">
+                                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                                        Collection Name *
+                                    </label>
+                                    <input
+                                        type="text"
+                                        value={name}
+                                        onChange={(e) => {
+                                            setName(e.target.value);
+                                            setNameError('');
+                                        }}
+                                        className={`w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+                                            nameError ? 'border-red-500' : 'border-gray-300'
+                                        }`}
+                                        placeholder="e.g., Favorites, Tutorials"
+                                        autoFocus
+                                    />
+                                    {nameError && (
+                                        <p className="mt-1 text-sm text-red-600">{nameError}</p>
+                                    )}
+                                </div>
+
+                                <div className="mb-6">
+                                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                                        Description (optional)
+                                    </label>
+                                    <textarea
+                                        value={description}
+                                        onChange={(e) => setDescription(e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                        placeholder="Describe this collection..."
+                                        rows="3"
+                                        maxLength="200"
+                                    />
+                                </div>
+
+                                <div className="flex justify-end space-x-3">
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setShowCollectionModal(false);
+                                            setEditingCollection(null);
+                                            setName('');
+                                            setDescription('');
+                                            setNameError('');
+                                        }}
+                                        className="px-4 py-2 text-gray-700 bg-gray-100 rounded-md hover:bg-gray-200 transition-colors"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        type="submit"
+                                        className="px-4 py-2 text-white bg-blue-600 rounded-md hover:bg-blue-700 transition-colors"
+                                    >
+                                        {collectionModalMode === 'create' ? 'Create' : 'Save'}
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                );
+            };
+
+            // Confirm Dialog Component
+            const ConfirmDialog = () => {
+                if (!showConfirmDialog || !confirmDialogData) return null;
+
+                return (
+                    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                        <div className="bg-white rounded-lg shadow-xl p-6 w-full max-w-md">
+                            <h2 className="text-xl font-bold mb-4">{confirmDialogData.title}</h2>
+                            <p className="text-gray-700 mb-6 whitespace-pre-line">{confirmDialogData.message}</p>
+
+                            <div className="flex justify-end space-x-3">
+                                <button
+                                    onClick={() => setShowConfirmDialog(false)}
+                                    className="px-4 py-2 text-gray-700 bg-gray-100 rounded-md hover:bg-gray-200 transition-colors"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    onClick={confirmDialogData.onConfirm}
+                                    className={`px-4 py-2 text-white rounded-md transition-colors ${
+                                        confirmDialogData.confirmStyle === 'danger'
+                                            ? 'bg-red-600 hover:bg-red-700'
+                                            : 'bg-blue-600 hover:bg-blue-700'
+                                    }`}
+                                >
+                                    {confirmDialogData.confirmText}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            // Collection Dropdown Component
+            const CollectionDropdown = ({ videoId, isQuickAdd = false }) => {
+                const [isOpen, setIsOpen] = useState(false);
+
+                const addToCollectionClick = async (collectionId) => {
+                    await handleAddToCollection([videoId], collectionId);
+                    setIsOpen(false);
+                };
+
+                return (
+                    <div className="relative">
+                        <button
+                            onClick={() => setIsOpen(!isOpen)}
+                            className="text-blue-600 hover:text-blue-800 text-sm font-medium"
+                        >
+                            {isQuickAdd ? '+' : 'Add to Collection'}
+                        </button>
+
+                        {isOpen && (
+                            <>
+                                <div
+                                    className="fixed inset-0 z-10"
+                                    onClick={() => setIsOpen(false)}
+                                />
+                                <div className="absolute right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg py-1 min-w-[180px] z-20 max-h-60 overflow-y-auto">
+                                    {collections.length === 0 ? (
+                                        <div className="px-4 py-2 text-sm text-gray-500">
+                                            No collections yet
+                                        </div>
+                                    ) : (
+                                        collections.map(collection => (
+                                            <button
+                                                key={collection.id}
+                                                onClick={() => addToCollectionClick(collection.id)}
+                                                className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-blue-50 flex items-center justify-between"
+                                            >
+                                                <span>{collection.name}</span>
+                                                <span className="text-xs text-gray-500">({collection.videoCount})</span>
+                                            </button>
+                                        ))
+                                    )}
+                                    <hr className="my-1" />
+                                    <button
+                                        onClick={() => {
+                                            setIsOpen(false);
+                                            setCollectionModalMode('create');
+                                            setEditingCollection(null);
+                                            setShowCollectionModal(true);
+                                        }}
+                                        className="w-full px-4 py-2 text-left text-sm text-blue-600 hover:bg-blue-50 font-medium"
+                                    >
+                                        + Create New
+                                    </button>
+                                </div>
+                            </>
+                        )}
+                    </div>
+                );
+            };
+
+            // Bulk Action Bar Component
+            const BulkActionBar = () => {
+                const [showDropdown, setShowDropdown] = useState(false);
+
+                if (selectedVideoIds.length === 0 || currentTab !== 'all-videos') return null;
+
+                return (
+                    <div className="mb-4 bg-blue-50 border border-blue-200 rounded-lg p-4 flex items-center justify-between">
+                        <div className="flex items-center space-x-4">
+                            <span className="text-sm font-medium text-blue-900">
+                                {selectedVideoIds.length} video{selectedVideoIds.length !== 1 ? 's' : ''} selected
+                            </span>
+
+                            <div className="relative">
+                                <button
+                                    onClick={() => setShowDropdown(!showDropdown)}
+                                    className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-md hover:bg-blue-700 transition-colors"
+                                >
+                                    Add to Collection ▼
+                                </button>
+
+                                {showDropdown && (
+                                    <>
+                                        <div
+                                            className="fixed inset-0 z-10"
+                                            onClick={() => setShowDropdown(false)}
+                                        />
+                                        <div className="absolute left-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg py-1 min-w-[200px] z-20 max-h-60 overflow-y-auto">
+                                            {collections.length === 0 ? (
+                                                <div className="px-4 py-2 text-sm text-gray-500">
+                                                    No collections yet
+                                                </div>
+                                            ) : (
+                                                collections.map(collection => (
+                                                    <button
+                                                        key={collection.id}
+                                                        onClick={() => {
+                                                            handleAddToCollection(selectedVideoIds, collection.id);
+                                                            setShowDropdown(false);
+                                                        }}
+                                                        className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-blue-50 flex items-center justify-between"
+                                                    >
+                                                        <span>{collection.name}</span>
+                                                        <span className="text-xs text-gray-500">({collection.videoCount})</span>
+                                                    </button>
+                                                ))
+                                            )}
+                                            <hr className="my-1" />
+                                            <button
+                                                onClick={() => {
+                                                    setShowDropdown(false);
+                                                    setCollectionModalMode('create');
+                                                    setEditingCollection(null);
+                                                    setShowCollectionModal(true);
+                                                }}
+                                                className="w-full px-4 py-2 text-left text-sm text-blue-600 hover:bg-blue-50 font-medium"
+                                            >
+                                                + Create New Collection
+                                            </button>
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+
+                        <button
+                            onClick={() => setSelectedVideoIds([])}
+                            className="text-sm text-gray-600 hover:text-gray-800"
+                        >
+                            Clear Selection
+                        </button>
+                    </div>
+                );
+            };
+
+            // Empty Collection State Component
+            const EmptyCollectionState = () => {
+                return (
+                    <div className="text-center py-12">
+                        <div className="text-gray-400 mb-4">
+                            <svg className="mx-auto h-12 w-12" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                            </svg>
+                        </div>
+                        <h3 className="text-lg font-medium text-gray-900 mb-2">No videos in this collection yet</h3>
+                        <p className="text-gray-500">Switch to "All Videos" tab to add some videos to this collection.</p>
+                    </div>
+                );
+            };
+
+            return (
+                <div className="container mx-auto p-6 max-w-7xl">
+                    <div className="bg-white rounded-lg shadow-lg p-6">
+                        <h1 className="text-2xl font-bold mb-6">YouTube Channel Analytics</h1>
+
+                        <form onSubmit={handleSubmit} className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">
+                                    Channel Handle or URL
+                                </label>
+                                <input
+                                    type="text"
+                                    value={channelInput}
+                                    onChange={(e) => setChannelInput(e.target.value)}
+                                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                    placeholder="Enter @ChannelName or youtube.com/@ChannelName"
+                                    required
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">
+                                    Time Range
+                                </label>
+                                <select
+                                    value={timeRange}
+                                    onChange={(e) => {
+                                        setTimeRange(e.target.value);
+                                        setIsCustomRange(e.target.value === 'custom');
+                                    }}
+                                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                >
+                                    {Object.entries(timeRanges).map(([key, { label }]) => (
+                                        <option key={key} value={key}>
+                                            {label}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">
+                                    YouTube API Key
+                                </label>
+                                <input
+                                    type="text"
+                                    value={apiKey}
+                                    onChange={(e) => setApiKey(e.target.value)}
+                                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                    placeholder="Enter your YouTube Data API v3 key"
+                                    required
+                                />
+                                <p className="mt-1 text-xs text-gray-500">
+                                    Get your API key from <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:text-blue-800">Google Cloud Console</a>
+                                </p>
+                            </div>
+
+                            {isCustomRange && (
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700">
+                                            Start Date
+                                        </label>
+                                        <input
+                                            type="date"
+                                            value={customRange.startDate}
+                                            onChange={(e) => setCustomRange(prev => ({
+                                                ...prev,
+                                                startDate: e.target.value
+                                            }))}
+                                            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                            required={isCustomRange}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700">
+                                            End Date
+                                        </label>
+                                        <input
+                                            type="date"
+                                            value={customRange.endDate}
+                                            onChange={(e) => setCustomRange(prev => ({
+                                                ...prev,
+                                                endDate: e.target.value
+                                            }))}
+                                            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                            required={isCustomRange}
+                                        />
+                                    </div>
+                                </div>
+                            )}
+
+                            <button
+                                type="submit"
+                                className="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors"
+                                disabled={isLoading}
+                            >
+                                {isLoading ? 'Loading...' : 'Analyze'}
+                            </button>
+                        </form>
+
+                        {error && (
+                            <div className="mt-4 p-4 bg-red-100 text-red-700 rounded-md">
+                                {error}
+                            </div>
+                        )}
+
+                        {/* Tab Navigation */}
+                        {(videos.length > 0 || collections.length > 0) && (
+                            <div className="mt-8">
+                                <TabNavigation />
+                            </div>
+                        )}
+
+                        {videos.length > 0 && currentTab === 'all-videos' && (
+                            <div className="mt-2">
+                                {/* Data Fetch Info */}
+                                {lastFetchTime && lastFetchParams && (
+                                    <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                                        <div className="text-sm text-blue-800">
+                                            <strong>Cached Data:</strong> {lastFetchParams.videoCount} videos from @{lastFetchParams.handle} ({lastFetchParams.timeRange})
+                                            <br />
+                                            <span className="text-xs text-blue-600">
+                                                Fetched at {lastFetchTime.toLocaleTimeString()} • Filters below work on cached data (no re-fetch)
+                                            </span>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Bulk Action Bar */}
+                                <BulkActionBar />
+
+                                <h2 className="text-xl font-semibold mb-4">
+                                    Results: {filteredVideos.length} of {videos.length} videos
+                                    {filteredVideos.length < videos.length && (
+                                        <span className="text-sm text-gray-500 ml-2">
+                                            ({videos.length - filteredVideos.length} filtered out)
+                                        </span>
+                                    )}
+                                </h2>
+
+                                {/* Filter Section */}
+                                <div className="mb-6 p-4 bg-gray-50 rounded-lg space-y-4">
+                                    <h3 className="text-lg font-medium mb-3">
+                                        Filter Results <span className="text-sm font-normal text-gray-600">(Client-side, no API calls)</span>
+                                    </h3>
+
+                                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                Video Type
+                                            </label>
+                                            <select
+                                                value={filters.videoType}
+                                                onChange={(e) => setFilters(prev => ({ ...prev, videoType: e.target.value }))}
+                                                className="block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                            >
+                                                <option value="all">All Types</option>
+                                                <option value="Short">Short (&lt; 1 min)</option>
+                                                <option value="Regular">Regular (&lt; 10 min)</option>
+                                                <option value="Medium">Medium (10-20 min)</option>
+                                                <option value="Long-form">Long-form (&gt; 20 min)</option>
+                                            </select>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                Duration
+                                            </label>
+                                            <select
+                                                value={filters.durationRange}
+                                                onChange={(e) => setFilters(prev => ({ ...prev, durationRange: e.target.value }))}
+                                                className="block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                            >
+                                                <option value="all">All Durations</option>
+                                                <option value="shorts">&lt; 1 minute (Shorts)</option>
+                                                <option value="short">1-5 minutes</option>
+                                                <option value="medium">5-20 minutes</option>
+                                                <option value="long">20-60 minutes</option>
+                                                <option value="very_long">&gt; 60 minutes</option>
+                                            </select>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                Minimum Views
+                                            </label>
+                                            <input
+                                                type="number"
+                                                value={filters.minViews}
+                                                onChange={(e) => setFilters(prev => ({ ...prev, minViews: e.target.value }))}
+                                                placeholder="e.g., 1000"
+                                                className="block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                            />
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                Search Title
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={filters.searchTerm}
+                                                onChange={(e) => setFilters(prev => ({ ...prev, searchTerm: e.target.value }))}
+                                                placeholder="Search in titles..."
+                                                className="block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                            />
+                                        </div>
+                                    </div>
+
+                                    <button
+                                        onClick={() => setFilters({ durationRange: 'all', videoType: 'all', minViews: '', searchTerm: '' })}
+                                        className="text-sm text-blue-600 hover:text-blue-800"
+                                    >
+                                        Clear All Filters
+                                    </button>
+                                </div>
+
+                                <h3 className="text-lg font-semibold mb-4">Most Popular Videos</h3>
+                                <SimpleBarChart data={filteredVideos} />
+
+                                <div className="mt-6 overflow-x-auto">
+                                    <table className="min-w-full divide-y divide-gray-200">
+                                        <thead className="bg-gray-50">
+                                            <tr>
+                                                <th className="px-3 py-3 text-left">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={selectedVideoIds.length === filteredVideos.length && filteredVideos.length > 0}
+                                                        onChange={toggleSelectAll}
+                                                        className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                                    />
+                                                </th>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Thumbnail
+                                                </th>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Video Title
+                                                </th>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Type
+                                                </th>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Duration
+                                                </th>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Views
+                                                </th>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Published Date
+                                                </th>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Link
+                                                </th>
+                                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                    Action
+                                                </th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="bg-white divide-y divide-gray-200">
+                                            {filteredVideos.map((video) => (
+                                                <tr key={video.videoId} className={selectedVideoIds.includes(video.videoId) ? 'bg-blue-50' : ''}>
+                                                    <td className="px-3 py-4 whitespace-nowrap">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={selectedVideoIds.includes(video.videoId)}
+                                                            onChange={() => toggleVideoSelection(video.videoId)}
+                                                            className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                                        />
+                                                    </td>
+                                                    <td className="px-6 py-4 whitespace-nowrap">
+                                                        <img
+                                                            src={video.thumbnail}
+                                                            alt={video.title}
+                                                            className="w-24 h-auto rounded"
+                                                        />
+                                                    </td>
+                                                    <td className="px-6 py-4">
+                                                        <div className="max-w-md">{video.title}</div>
+                                                    </td>
+                                                    <td className="px-6 py-4 whitespace-nowrap">
+                                                        <span className={`px-2 py-1 text-xs font-semibold rounded ${
+                                                            video.videoType === 'Short' ? 'bg-red-100 text-red-800' :
+                                                            video.videoType === 'Regular' ? 'bg-blue-100 text-blue-800' :
+                                                            video.videoType === 'Medium' ? 'bg-green-100 text-green-800' :
+                                                            'bg-purple-100 text-purple-800'
+                                                        }`}>
+                                                            {video.videoType}
+                                                        </span>
+                                                    </td>
+                                                    <td className="px-6 py-4 whitespace-nowrap">
+                                                        {video.durationFormatted}
+                                                    </td>
+                                                    <td className="px-6 py-4 whitespace-nowrap">
+                                                        {formatViewCount(video.views)}
+                                                    </td>
+                                                    <td className="px-6 py-4 whitespace-nowrap">
+                                                        {new Date(video.publishedAt).toLocaleDateString()}
+                                                    </td>
+                                                    <td className="px-6 py-4 whitespace-nowrap">
+                                                        <a
+                                                            href={`https://www.youtube.com/watch?v=${video.videoId}`}
+                                                            target="_blank"
+                                                            rel="noopener noreferrer"
+                                                            className="text-blue-600 hover:text-blue-800 cursor-pointer"
+                                                        >
+                                                            Watch
+                                                        </a>
+                                                    </td>
+                                                    <td className="px-6 py-4 whitespace-nowrap">
+                                                        <CollectionDropdown videoId={video.videoId} isQuickAdd={true} />
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Collection View */}
+                        {currentTab !== 'all-videos' && (
+                            <div className="mt-2">
+                                {filteredVideos.length === 0 && currentCollectionVideos.length === 0 ? (
+                                    <EmptyCollectionState />
+                                ) : (
+                                    <>
+                                        <h2 className="text-xl font-semibold mb-4">
+                                            Collection: {collections.find(c => c.id === currentTab)?.name}
+                                            <span className="text-sm text-gray-500 ml-2">
+                                                ({filteredVideos.length} video{filteredVideos.length !== 1 ? 's' : ''})
+                                            </span>
+                                        </h2>
+
+                                        {/* Filter Section */}
+                                        <div className="mb-6 p-4 bg-gray-50 rounded-lg space-y-4">
+                                            <h3 className="text-lg font-medium mb-3">
+                                                Filter Results <span className="text-sm font-normal text-gray-600">(Client-side)</span>
+                                            </h3>
+
+                                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                        Video Type
+                                                    </label>
+                                                    <select
+                                                        value={filters.videoType}
+                                                        onChange={(e) => setFilters(prev => ({ ...prev, videoType: e.target.value }))}
+                                                        className="block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                                    >
+                                                        <option value="all">All Types</option>
+                                                        <option value="Short">Short (&lt; 1 min)</option>
+                                                        <option value="Regular">Regular (&lt; 10 min)</option>
+                                                        <option value="Medium">Medium (10-20 min)</option>
+                                                        <option value="Long-form">Long-form (&gt; 20 min)</option>
+                                                    </select>
+                                                </div>
+
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                        Duration
+                                                    </label>
+                                                    <select
+                                                        value={filters.durationRange}
+                                                        onChange={(e) => setFilters(prev => ({ ...prev, durationRange: e.target.value }))}
+                                                        className="block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                                    >
+                                                        <option value="all">All Durations</option>
+                                                        <option value="shorts">&lt; 1 minute (Shorts)</option>
+                                                        <option value="short">1-5 minutes</option>
+                                                        <option value="medium">5-20 minutes</option>
+                                                        <option value="long">20-60 minutes</option>
+                                                        <option value="very_long">&gt; 60 minutes</option>
+                                                    </select>
+                                                </div>
+
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                        Minimum Views
+                                                    </label>
+                                                    <input
+                                                        type="number"
+                                                        value={filters.minViews}
+                                                        onChange={(e) => setFilters(prev => ({ ...prev, minViews: e.target.value }))}
+                                                        placeholder="e.g., 1000"
+                                                        className="block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                                    />
+                                                </div>
+
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                        Search Title
+                                                    </label>
+                                                    <input
+                                                        type="text"
+                                                        value={filters.searchTerm}
+                                                        onChange={(e) => setFilters(prev => ({ ...prev, searchTerm: e.target.value }))}
+                                                        placeholder="Search in titles..."
+                                                        className="block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+                                                    />
+                                                </div>
+                                            </div>
+
+                                            <button
+                                                onClick={() => setFilters({ durationRange: 'all', videoType: 'all', minViews: '', searchTerm: '' })}
+                                                className="text-sm text-blue-600 hover:text-blue-800"
+                                            >
+                                                Clear All Filters
+                                            </button>
+                                        </div>
+
+                                        <h3 className="text-lg font-semibold mb-4">Most Popular Videos</h3>
+                                        <SimpleBarChart data={filteredVideos} />
+
+                                        <div className="mt-6 overflow-x-auto">
+                                            <table className="min-w-full divide-y divide-gray-200">
+                                                <thead className="bg-gray-50">
+                                                    <tr>
+                                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                            Thumbnail
+                                                        </th>
+                                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                            Video Title
+                                                        </th>
+                                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                            Type
+                                                        </th>
+                                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                            Duration
+                                                        </th>
+                                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                            Views
+                                                        </th>
+                                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                            Published Date
+                                                        </th>
+                                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                            Link
+                                                        </th>
+                                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                            Action
+                                                        </th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="bg-white divide-y divide-gray-200">
+                                                    {filteredVideos.map((video) => (
+                                                        <tr key={video.videoId}>
+                                                            <td className="px-6 py-4 whitespace-nowrap">
+                                                                <img
+                                                                    src={video.thumbnail}
+                                                                    alt={video.title}
+                                                                    className="w-24 h-auto rounded"
+                                                                />
+                                                            </td>
+                                                            <td className="px-6 py-4">
+                                                                <div className="max-w-md">{video.title}</div>
+                                                            </td>
+                                                            <td className="px-6 py-4 whitespace-nowrap">
+                                                                <span className={`px-2 py-1 text-xs font-semibold rounded ${
+                                                                    video.videoType === 'Short' ? 'bg-red-100 text-red-800' :
+                                                                    video.videoType === 'Regular' ? 'bg-blue-100 text-blue-800' :
+                                                                    video.videoType === 'Medium' ? 'bg-green-100 text-green-800' :
+                                                                    'bg-purple-100 text-purple-800'
+                                                                }`}>
+                                                                    {video.videoType}
+                                                                </span>
+                                                            </td>
+                                                            <td className="px-6 py-4 whitespace-nowrap">
+                                                                {video.durationFormatted}
+                                                            </td>
+                                                            <td className="px-6 py-4 whitespace-nowrap">
+                                                                {formatViewCount(video.views)}
+                                                            </td>
+                                                            <td className="px-6 py-4 whitespace-nowrap">
+                                                                {new Date(video.publishedAt).toLocaleDateString()}
+                                                            </td>
+                                                            <td className="px-6 py-4 whitespace-nowrap">
+                                                                <a
+                                                                    href={`https://www.youtube.com/watch?v=${video.videoId}`}
+                                                                    target="_blank"
+                                                                    rel="noopener noreferrer"
+                                                                    className="text-blue-600 hover:text-blue-800 cursor-pointer"
+                                                                >
+                                                                    Watch
+                                                                </a>
+                                                            </td>
+                                                            <td className="px-6 py-4 whitespace-nowrap">
+                                                                <button
+                                                                    onClick={() => handleRemoveFromCollection([video.videoId])}
+                                                                    className="text-red-600 hover:text-red-800 text-sm font-medium"
+                                                                >
+                                                                    Remove
+                                                                </button>
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        )}
+
+                        {/* Modals and Dialogs */}
+                        <Toast />
+                        <CollectionModal />
+                        <ConfirmDialog />
+                    </div>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<YouTubeAnalytics />, document.getElementById('root'));
+    </script>
+</body>
+
+</html>
